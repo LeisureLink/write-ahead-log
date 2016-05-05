@@ -1,0 +1,9 @@
+doc/
+src/
+test/
+.babel*
+.eslint*
+.jsbeaut*
+.git*
+esdoc*
+circle.yml

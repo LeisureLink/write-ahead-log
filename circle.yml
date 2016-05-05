@@ -1,0 +1,10 @@
+machine:
+  timezone:
+    America/Denver
+  node:
+    version: 4.2.4
+deployment:
+  production:
+    tag: /v.*/
+    commands:
+      - npm publish
