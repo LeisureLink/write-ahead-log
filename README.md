@@ -16,7 +16,31 @@ We also define _Log Serial Number_ (LSN) as an integer identfier numbered from 0
 
 We provide a simple recovery mechanism that visits each uncommitted entry, in order, and commits each, as long as the handler you supply indicates it is safe to do so by returning a truthy value; when your handler returns a falsy value, remaining uncommitted _Log Entries_ are truncated. The LSN/index associated with those uncommitted _Log Entries_ will be re-issued whan a subsequent _Log Entry_ is made. This scheme enables our algorithm to be simple and fast. If your code requires guaranteed unique LSNs across restarts (a requirement for most database systems), we feel we have provided the collaboration semantics necessary for you to implement such guarantees on top of `wal` as an additional level of LSN indirection.
 
+## Install
+
+```bash
+npm install wal 
+```
+
 ## Use
+
+**es5**
+```javascript
+var WriteAheadLog = require('wal').WriteAheadLog;
+```
+
+**es6**
+```javascript
+import { WriteAheadLog } from 'wal';
+```
+
+### Write-Work-Commit Cycle
+
+Write-ahead logging is accomplished through in a _write-work-commit_ cycle. 
+
+* First &mdash; `write` a log entry containing enough information to describe the activity and recover it if there is a subsequent failure,
+* Second &mdash; perform the work,
+* Third &mdash; when the activity is completed, `commit` the log entry; otherwise, if the activity cannot be completed, `truncate` the log at the log entry's LSN.
 
 ```javascript
 const WriteAheadLog = require('wal');
@@ -71,12 +95,16 @@ WriteAheadLog.openOrCreate({ path, writable })
 
 Chaos can occur at any time, for an illustration of simple failure and recovery, run the example script [chaotic-operations](https://github.com/LeisureLink/write-ahead-log/blob/master/examples/chaotic-operations.js) and monitor what happens in both the log and index. This should give you a feel for how to scaffold on top of `wal`.
 
+### Sequencing
+
+`wal` imposes sequencing of commits; LSN/indexes must be committed in order. Obviously parallel operations, such as those waiting on IO will often complete out of order. It is the responsibility of the caller to ensure that out of order completion is resequenced before being applied to the log for commit.
+
 ## More Documentation
 
 Detailed documentation can be generated locally using npm scripts:
 
 ```bash
-git clone git@github.com:LeisureLink/write-ahead-log
+git clone git@github.com:LeisureLink/write-ahead-log.git
 cd write-ahead-log
 npm install && npm run doc
 open doc/index.html
