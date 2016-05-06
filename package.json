@@ -2,6 +2,13 @@
   "name": "wal",
   "version": "0.9.1",
   "description": "An implementation of write-ahead logging (WAL) for nodejs.",
+  "keywords": [
+    "wal",
+    "write-ahead",
+    "log",
+    "automic",
+    "durable"
+  ],
   "main": "index.js",
   "scripts": {
     "doc": "esdoc -c ./esdoc.json",
