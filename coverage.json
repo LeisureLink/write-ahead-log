@@ -1,0 +1,46 @@
+{
+  "coverage": "47.61%",
+  "expectCount": 42,
+  "actualCount": 20,
+  "files": {
+    "src/log-index-file.js": {
+      "expectCount": 19,
+      "actualCount": 0,
+      "undocumentLines": [
+        66,
+        90,
+        245,
+        110,
+        100,
+        68,
+        148,
+        163,
+        131,
+        95,
+        210,
+        105,
+        125,
+        85,
+        79,
+        137,
+        231,
+        188,
+        81
+      ]
+    },
+    "src/queue.js": {
+      "expectCount": 7,
+      "actualCount": 7,
+      "undocumentLines": []
+    },
+    "src/write-ahead-log.js": {
+      "expectCount": 16,
+      "actualCount": 13,
+      "undocumentLines": [
+        313,
+        25,
+        268
+      ]
+    }
+  }
+}

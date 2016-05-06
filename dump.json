@@ -1,0 +1,2341 @@
+[
+  {
+    "__docId__": 0,
+    "kind": "file",
+    "static": true,
+    "variation": null,
+    "name": "src/index.js",
+    "memberof": null,
+    "longname": "src/index.js",
+    "access": null,
+    "description": null,
+    "lineNumber": 1,
+    "content": "'use strict';\n\nimport Queue from './queue';\nimport LogIndexFile from './log-index-file';\nimport WriteAheadLog from './write-ahead-log';\n\nexport { Queue, LogIndexFile, WriteAheadLog };\n"
+  },
+  {
+    "__docId__": 1,
+    "kind": "file",
+    "static": true,
+    "variation": null,
+    "name": "src/log-index-file.js",
+    "memberof": null,
+    "longname": "src/log-index-file.js",
+    "access": null,
+    "description": null,
+    "lineNumber": 1,
+    "content": "'use strict';\n\nimport assert from 'assert-plus';\nimport RandomAccessFile from 'ranfile';\n\n/******************************************************************************\nThe log index file is a side-file that tracks the byte offsets to each distinct\nlog entry. Using the side-file indexing scheme, we are able to efficiently\nstore and retrieve each distinct log entry without having to care about the\nentry's byte content. In this scheme, log-serial-numbers (LSNs) are the natural\ninteger index at which the log entry was written, as if being written to an\narray.\n\nLayout:\n\nmarker   -- 4 marker bytes identifying the file's type: IDX$\nbase     -- 4 bytes integer (big-endian); an index offset, usually 0 (zero).\n            Offsets are only meaningful when indexes are split across many\n            files so are a placeholder for future work.\nhead     -- 4 bytes integer (big-endian); the write head (next unused entry)\ncommit   -- 4 bytes integer (big-endian); the commit head (may trail head)\n\nIn this layout there are 16 header bytes (hlen), therefore each subsequent 4\nbytes contains a pointer to a log entry's starting byte in the indexed write-\nahead-log (WAL).\n\nhlen + ((index - base) * sizeof(int))\n\n\nExample (octets)...\n\n            Base      Head        Commit      Index 0     Index 1\n            v           v           v           V           v\n49 44 58 24 00 00 00 00 00 00 00 02 00 00 00 01 00 00 00 00 00 00 00 58 \\\n\nIndex 2\nv\n00 00 02 1f\n\nLog Entry 0 begins at byte 0\nLog Entry 1 begins at byte 88\nLog Entry 2 begins at byte 543\n\n\n\n******************************************************************************/\n\nconst MARKER = 'IDX$';\nconst OFS_MARKER = 0;\nconst OFS_BASEINDEX = 4;\nconst OFS_HEAD = 8;\nconst OFS_COMMIT = 12;\nconst HLEN = 16;\nconst SIZEOF_INT = 4;\nconst DEF_COMMIT = -1;\n\nconst $file = Symbol('file');\nconst $header = Symbol('header');\n\nfunction allocFill(len) {\n  return (Buffer.alloc) ?\n    Buffer.alloc(len) :\n    new Buffer(len); // deprecated in 5.x+\n}\n\nclass LogIndexFile {\n\n  constructor(file) {\n    assert.object(file, 'file');\n    assert.func(file.read, 'file.read');\n    assert.func(file.write, 'file.write');\n    assert.func(file.close, 'file.close');\n    if (file.size < HLEN) {\n      throw new Error('File too small to be an index file.');\n    }\n    this[$file] = file;\n  }\n\n  get name() { return this[$file].name; }\n\n  get writable() {\n    return this[$file].writable;\n  }\n\n  get marker() {\n    assert.ok(this[$header], 'index must be open');\n    return this[$header].toString('ascii', OFS_MARKER, OFS_BASEINDEX);\n  }\n\n  get baseIndex() {\n    assert.ok(this[$header], 'index must be open');\n    return this[$header].readInt32BE(OFS_BASEINDEX, true);\n  }\n\n  get head() {\n    assert.ok(this[$header], 'index must be open');\n    return this[$header].readInt32BE(OFS_HEAD, true);\n  }\n\n  get commitHead() {\n    assert.ok(this[$header], 'index must be open');\n    return this[$header].readInt32BE(OFS_COMMIT, true);\n  }\n\n  isCommitted(index) {\n    assert.ok(this[$header], 'index must be open');\n    return index < this.commitHead;\n  }\n\n  commit(index) {\n    assert.ok(this[$header], 'index must be open');\n    assert.number(index, 'index');\n    let expected = this.commitHead + 1;\n    if (index < expected) {\n      return Promise.resolve(index);\n    }\n    if (index !== expected) {\n      return Promise.reject(new Error(`Out of order commit; expected ${expected} but received ${index}.`));\n    }\n    this[$header].writeInt32BE(index, OFS_COMMIT, true);\n    return this[$file].write(OFS_COMMIT, this[$header], OFS_COMMIT, SIZEOF_INT)\n      .then(() => index);\n  }\n\n  localizeIndex(index) {\n    assert.number(index, 'index');\n    index = index - this.baseIndex;\n    return index;\n  }\n\n  globalizeIndex(index) {\n    assert.number(index, 'index');\n    index = index + this.baseIndex;\n    return index;\n  }\n\n  offset(index) {\n    assert.ok(index <= this.head, 'index out of range');\n    assert.ok(this[$header], 'index must be open');\n    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);\n    return this[$file].read(ofs, SIZEOF_INT)\n      .then(data => {\n        let offset = data.readInt32BE(0, SIZEOF_INT);\n        return offset;\n      });\n  }\n\n  get(index) {\n    assert.number(index, 'index');\n    assert.ok(index < this.head, 'index out of range');\n    assert.ok(this[$header], 'index must be open');\n    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);\n    return this[$file].read(ofs, 2 * SIZEOF_INT)\n      .then(data => {\n        let offset = data.readInt32BE(0, SIZEOF_INT);\n        return {\n          offset,\n          length: data.readInt32BE(SIZEOF_INT, SIZEOF_INT) - offset\n        };\n      });\n  }\n\n  getRange(index, count) {\n    assert.number(index, 'index');\n    assert.ok(index < this.head, 'index out of range');\n    assert.number(count, 'count');\n    assert.ok(this[$header], 'index must be open');\n    // head points at the next entry\n    let limit = (this.head - index);\n    assert.ok(count <= limit, 'count puts index out of range');\n    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);\n    return this[$file].read(ofs, (count + 1) * SIZEOF_INT)\n      .then(data => {\n        let i = -1;\n        let result = [];\n        while (++i < count) {\n          let offset = data.readInt32BE(i * SIZEOF_INT, SIZEOF_INT);\n          result.push({\n            index: index + i,\n            offset,\n            length: data.readInt32BE((i + 1) * SIZEOF_INT, SIZEOF_INT) - offset\n          });\n        }\n        return result;\n      });\n  }\n\n  truncate(from) {\n    assert.number(from, 'from');\n    assert.ok(from > this.commitHead, 'cannot truncate a committed log entry');\n    assert.ok(from < this.head, 'index out of range');\n    let header = this[$header];\n    header.writeInt32BE(from, OFS_HEAD, SIZEOF_INT);\n    return this[$file].write(OFS_HEAD, header, OFS_HEAD, SIZEOF_INT)\n      .then(() => {\n        if (this.head === this.baseIndex) {\n          return this[$file].read(HLEN, SIZEOF_INT)\n            .then(data => {\n              return {\n                offset: data.readInt32BE(0, SIZEOF_INT),\n                length: 0\n              };\n            });\n        }\n        return this.get(this.head - 1);\n      })\n      .then(rec => rec.offset + rec.length);\n  }\n\n  increment(offset) {\n    assert.ok(this[$header], 'index must be open');\n    // write the offset into the next index location (typically at EOF),\n    // then update and write the header reference, which completes the\n    // increment.\n    let header = this[$header];\n    let current = this.head;\n    let next = current + 1;\n    let ofs = HLEN + (this.localizeIndex(next) * SIZEOF_INT);\n    let data = allocFill(SIZEOF_INT);\n    data.writeInt32BE(offset, 0, SIZEOF_INT);\n    return this[$file].write(ofs, data)\n      .then(() => {\n        header.writeInt32BE(next, OFS_HEAD, SIZEOF_INT);\n        return this[$file].write(OFS_HEAD, header, OFS_HEAD, SIZEOF_INT);\n      })\n      .then(() => {\n        return current;\n      });\n  }\n\n  open() {\n    assert.ok(!this[$header], 'index already open');\n    let file = this[$file];\n    return file.read(OFS_MARKER, HLEN)\n      .then(data => {\n        let marker = data.toString('ascii', OFS_MARKER, OFS_BASEINDEX);\n        if (marker !== MARKER) {\n          throw new Error(`Invalid index file; expected file marker to be ${MARKER} but found ${marker}.`);\n        }\n        this[$header] = data;\n        return this;\n      });\n  }\n\n  close() {\n    return this[$file].close()\n      .then(() => {\n        this[$header] = null;\n      });\n  }\n\n}\n\nfunction open(path, writable) {\n  assert.string(path, 'path');\n  assert.optionalBool(writable, 'writable');\n  writable = writable === true;\n  return RandomAccessFile.open(path, writable)\n    .then(file => new LogIndexFile(file).open());\n}\n\nfunction create(path, baseIndex, byteOffset) {\n  assert.string(path, 'path');\n  assert.optionalNumber(baseIndex, 'baseIndex');\n  assert.optionalNumber(byteOffset, 'byteOffset');\n  if (baseIndex === undefined) {\n    baseIndex = 0;\n  }\n  if (byteOffset === undefined) {\n    byteOffset = 0;\n  }\n  let data = allocFill(HLEN + SIZEOF_INT);\n  data.write(MARKER, 'ascii');\n  data.writeInt32BE(baseIndex, OFS_BASEINDEX, true);\n  data.writeInt32BE(baseIndex, OFS_HEAD, true);\n  data.writeInt32BE(DEF_COMMIT, OFS_COMMIT, true);\n  data.writeInt32BE(byteOffset, HLEN, true);\n  return RandomAccessFile.create(path)\n    .then(file => file.write(OFS_MARKER, data)\n      .then(() => new LogIndexFile(file).open()));\n}\n\nLogIndexFile.open = open;\nLogIndexFile.create = create;\n\nexport default LogIndexFile;\n"
+  },
+  {
+    "__docId__": 2,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "MARKER",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~MARKER",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": "***************************************************************************\nThe log index file is a side-file that tracks the byte offsets to each distinct\nlog entry. Using the side-file indexing scheme, we are able to efficiently\nstore and retrieve each distinct log entry without having to care about the\nentry's byte content. In this scheme, log-serial-numbers (LSNs) are the natural\ninteger index at which the log entry was written, as if being written to an\narray.\n\nLayout:\n\nmarker   -- 4 marker bytes identifying the file's type: IDX$\nbase     -- 4 bytes integer (big-endian); an index offset, usually 0 (zero).\nOffsets are only meaningful when indexes are split across many\nfiles so are a placeholder for future work.\nhead     -- 4 bytes integer (big-endian); the write head (next unused entry)\ncommit   -- 4 bytes integer (big-endian); the commit head (may trail head)\n\nIn this layout there are 16 header bytes (hlen), therefore each subsequent 4\nbytes contains a pointer to a log entry's starting byte in the indexed write-\nahead-log (WAL).\n\nhlen + ((index - base) * sizeof(int))\n\n\nExample (octets)...\n\nBase      Head        Commit      Index 0     Index 1\nv           v           v           V           v\n49 44 58 24 00 00 00 00 00 00 00 02 00 00 00 01 00 00 00 00 00 00 00 58 \\\n\nIndex 2\nv\n00 00 02 1f\n\nLog Entry 0 begins at byte 0\nLog Entry 1 begins at byte 88\nLog Entry 2 begins at byte 543\n\n\n\n****************************************************************************",
+    "lineNumber": 48,
+    "type": {
+      "types": [
+        "string"
+      ]
+    }
+  },
+  {
+    "__docId__": 3,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "OFS_MARKER",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~OFS_MARKER",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 49,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 4,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "OFS_BASEINDEX",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~OFS_BASEINDEX",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 50,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 5,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "OFS_HEAD",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~OFS_HEAD",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 51,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 6,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "OFS_COMMIT",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~OFS_COMMIT",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 52,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 7,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "HLEN",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~HLEN",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 53,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 8,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "SIZEOF_INT",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~SIZEOF_INT",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 54,
+    "undocument": true,
+    "type": {
+      "types": [
+        "number"
+      ]
+    }
+  },
+  {
+    "__docId__": 9,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "DEF_COMMIT",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~DEF_COMMIT",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 55,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 10,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$file",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~$file",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 57,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 11,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$header",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~$header",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 58,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 12,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "allocFill",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~allocFill",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 60,
+    "undocument": true,
+    "params": [
+      {
+        "name": "len",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 13,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "open",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~open",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 254,
+    "undocument": true,
+    "params": [
+      {
+        "name": "path",
+        "types": [
+          "*"
+        ]
+      },
+      {
+        "name": "writable",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 14,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "create",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~create",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 262,
+    "undocument": true,
+    "params": [
+      {
+        "name": "path",
+        "types": [
+          "*"
+        ]
+      },
+      {
+        "name": "baseIndex",
+        "types": [
+          "*"
+        ]
+      },
+      {
+        "name": "byteOffset",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 15,
+    "kind": "class",
+    "static": true,
+    "variation": null,
+    "name": "LogIndexFile",
+    "memberof": "src/log-index-file.js",
+    "longname": "src/log-index-file.js~LogIndexFile",
+    "access": null,
+    "export": true,
+    "importPath": "wal/src/log-index-file.js",
+    "importStyle": "LogIndexFile",
+    "description": null,
+    "lineNumber": 66,
+    "undocument": true,
+    "interface": false
+  },
+  {
+    "__docId__": 16,
+    "kind": "constructor",
+    "static": false,
+    "variation": null,
+    "name": "constructor",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#constructor",
+    "access": null,
+    "description": null,
+    "lineNumber": 68,
+    "undocument": true,
+    "params": [
+      {
+        "name": "file",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "generator": false
+  },
+  {
+    "__docId__": 17,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "name",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#name",
+    "access": null,
+    "description": null,
+    "lineNumber": 79,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 18,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "writable",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#writable",
+    "access": null,
+    "description": null,
+    "lineNumber": 81,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 19,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "marker",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#marker",
+    "access": null,
+    "description": null,
+    "lineNumber": 85,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 20,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "baseIndex",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#baseIndex",
+    "access": null,
+    "description": null,
+    "lineNumber": 90,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 21,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "head",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#head",
+    "access": null,
+    "description": null,
+    "lineNumber": 95,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 22,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "commitHead",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#commitHead",
+    "access": null,
+    "description": null,
+    "lineNumber": 100,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 23,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "isCommitted",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#isCommitted",
+    "access": null,
+    "description": null,
+    "lineNumber": 105,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 24,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "commit",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#commit",
+    "access": null,
+    "description": null,
+    "lineNumber": 110,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 25,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "localizeIndex",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#localizeIndex",
+    "access": null,
+    "description": null,
+    "lineNumber": 125,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 26,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "globalizeIndex",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#globalizeIndex",
+    "access": null,
+    "description": null,
+    "lineNumber": 131,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 27,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "offset",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#offset",
+    "access": null,
+    "description": null,
+    "lineNumber": 137,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 28,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "get",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#get",
+    "access": null,
+    "description": null,
+    "lineNumber": 148,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 29,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "getRange",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#getRange",
+    "access": null,
+    "description": null,
+    "lineNumber": 163,
+    "undocument": true,
+    "params": [
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      },
+      {
+        "name": "count",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 30,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "truncate",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#truncate",
+    "access": null,
+    "description": null,
+    "lineNumber": 188,
+    "undocument": true,
+    "params": [
+      {
+        "name": "from",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 31,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "increment",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#increment",
+    "access": null,
+    "description": null,
+    "lineNumber": 210,
+    "undocument": true,
+    "params": [
+      {
+        "name": "offset",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 32,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "open",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#open",
+    "access": null,
+    "description": null,
+    "lineNumber": 231,
+    "undocument": true,
+    "params": [],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 33,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "close",
+    "memberof": "src/log-index-file.js~LogIndexFile",
+    "longname": "src/log-index-file.js~LogIndexFile#close",
+    "access": null,
+    "description": null,
+    "lineNumber": 245,
+    "undocument": true,
+    "params": [],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 34,
+    "kind": "file",
+    "static": true,
+    "variation": null,
+    "name": "src/queue.js",
+    "memberof": null,
+    "longname": "src/queue.js",
+    "access": null,
+    "description": null,
+    "lineNumber": 1,
+    "content": "'use strict';\n\nconst $queue = Symbol('queue');\nconst $offset = Symbol('offset');\n\n/**\n * A simple queue class.\n *\n * This is an obvious es6 dirivative of [Stephen Morley's queue implementation](http://code.stephenmorley.org/javascript/queues/).\n */\nclass Queue {\n\n  /**\n   * Creates a new instance.\n   */\n  constructor() {\n    this[$queue] = [];\n    this[$offset] = 0;\n  }\n\n  /**\n   * @type {number} The queue's length.\n   */\n  get length() {\n    return (this[$queue].length - this[$offset]);\n  }\n\n  /**\n   * @type {boolean} Indicates whether the queue is empty.\n   */\n  get isEmpty() {\n    return (this.length === 0);\n  }\n\n  /**\n   * Enqueues the specified item.\n   * @param item - An item to put on the queue.\n   */\n  enqueue(item) {\n    this[$queue].push(item);\n  }\n\n  /**\n   * Dequeues the item at the head of the queue, removing the item.\n   * @return The item at the head of the queue or `undefined` if the queue is empty.\n   */\n  dequeue() {\n    if (this.length === 0) {\n      return undefined;\n    }\n    let item = this[$queue][this[$offset]];\n    if (++this[$offset] * 2 >= this[$queue].length) {\n      this[$queue] = this[$queue].slice(this[$offset]);\n      this[$offset] = 0;\n    }\n    return item;\n  }\n\n  /**\n   * Peeks at the item at the head of the queue without removing it.\n   * @return The item at the head of the queue or `undefined` if the queue is empty.\n   */\n  peek() {\n    return (this.length > 0 ? this[$queue][this[$offset]] : undefined);\n  }\n}\n\nexport default Queue;\n"
+  },
+  {
+    "__docId__": 35,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$queue",
+    "memberof": "src/queue.js",
+    "longname": "src/queue.js~$queue",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/queue.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 3,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 36,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$offset",
+    "memberof": "src/queue.js",
+    "longname": "src/queue.js~$offset",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/queue.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 4,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 37,
+    "kind": "class",
+    "static": true,
+    "variation": null,
+    "name": "Queue",
+    "memberof": "src/queue.js",
+    "longname": "src/queue.js~Queue",
+    "access": null,
+    "export": true,
+    "importPath": "wal/src/queue.js",
+    "importStyle": "Queue",
+    "description": "A simple queue class.\n\nThis is an obvious es6 dirivative of [Stephen Morley's queue implementation](http://code.stephenmorley.org/javascript/queues/).",
+    "lineNumber": 11,
+    "interface": false
+  },
+  {
+    "__docId__": 38,
+    "kind": "constructor",
+    "static": false,
+    "variation": null,
+    "name": "constructor",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#constructor",
+    "access": null,
+    "description": "Creates a new instance.",
+    "lineNumber": 16,
+    "params": [],
+    "generator": false
+  },
+  {
+    "__docId__": 39,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "length",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#length",
+    "access": null,
+    "description": "",
+    "lineNumber": 24,
+    "type": {
+      "nullable": null,
+      "types": [
+        "number"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 40,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "isEmpty",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#isEmpty",
+    "access": null,
+    "description": "",
+    "lineNumber": 31,
+    "type": {
+      "nullable": null,
+      "types": [
+        "boolean"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 41,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "enqueue",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#enqueue",
+    "access": null,
+    "description": "Enqueues the specified item.",
+    "lineNumber": 39,
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "*"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "item",
+        "description": "An item to put on the queue."
+      }
+    ],
+    "generator": false
+  },
+  {
+    "__docId__": 42,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "dequeue",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#dequeue",
+    "access": null,
+    "description": "Dequeues the item at the head of the queue, removing the item.",
+    "lineNumber": 47,
+    "params": [],
+    "return": {
+      "nullable": null,
+      "types": [
+        "*"
+      ],
+      "spread": false,
+      "description": "The item at the head of the queue or `undefined` if the queue is empty."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 43,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "peek",
+    "memberof": "src/queue.js~Queue",
+    "longname": "src/queue.js~Queue#peek",
+    "access": null,
+    "description": "Peeks at the item at the head of the queue without removing it.",
+    "lineNumber": 63,
+    "params": [],
+    "return": {
+      "nullable": null,
+      "types": [
+        "*"
+      ],
+      "spread": false,
+      "description": "The item at the head of the queue or `undefined` if the queue is empty."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 44,
+    "kind": "file",
+    "static": true,
+    "variation": null,
+    "name": "src/write-ahead-log.js",
+    "memberof": null,
+    "longname": "src/write-ahead-log.js",
+    "access": null,
+    "description": null,
+    "lineNumber": 1,
+    "content": "'use strict';\n\nimport assert from 'assert-plus';\nimport fs from 'fs';\nimport { Readable } from 'stream';\nimport RandomAccessFile from 'ranfile';\n\nimport Queue from './queue';\nimport LogIndexFile from './log-index-file';\n\nconst DEFAULT_INDEX_EXT = '.lix';\n\nconst $index = Symbol('index');\nconst $file = Symbol('file');\n\n/**\n * An encapsulation of write-ahead logging behavior.\n *\n * Write-ahead logging (WAL) is a building block used to improve automicity and durability in distributed systems. WAL improves these properties by providing persistent, sequenced storage for _Log Entries_ as well as a record of which _Log Entries_ have been committed. Write-ahead logging enables systems to recover from failures, whether those failures are in software, storage, or the network.\n *\n * This implementation provides a basic semantic on which reliable systems can be built.\n */\nclass WriteAheadLog {\n\n  constructor(file, index) {\n    assert.object(file, 'file');\n    assert.object(index, 'index');\n    this[$file] = file;\n    this[$index] = index;\n  }\n\n  /**\n   * @type {string} - The log's file name (fully qualified path).\n   */\n  get name() {\n    return this[$file].name;\n  }\n\n  /**\n   * @type {string} - The log's index file name (fully qualified path).\n   */\n  get index() {\n    return this[$index].name;\n  }\n\n  /**\n   * @type {boolean} - Indicates whether the log was opened in a writable mode.\n   */\n  get writable() {\n    return this[$file].writable;\n  }\n\n  /**\n   * @type {number} - The log's size in bytes.\n   */\n  get size() {\n    return this[$file].size;\n  }\n\n  /**\n   * @type {number} - The next LSN/index (the write head).\n   */\n  get next() {\n    return this[$index].head;\n  }\n\n  /**\n   * @type {number} - The most recently commited LSN/index.\n   */\n  get commitHead() {\n    return this[$index].commitHead;\n  }\n\n  /**\n   * Determines if the specified LSN/index has been committed.\n   *\n   * ```javascript\n   * wal.isCommitted(lsn)\n   *   .then(committed => {\n   *      if (committed) console.log(lsn + ' is committed');\n   *   });\n   * ```\n   * @param {number} index - The LSN/index to check.\n   * @returns {Promise} - A promise that upon success is resolved with boolean indicating whether the LSN/index has been committed.\n   */\n  isCommitted(index) {\n    assert.number(index, 'index');\n    return this[$index].isCommitted(index);\n  }\n\n  /**\n   * Commits the specified, uncommitted LSN/index.\n   *\n   * ```javascript\n   * wal.commit(lsn)\n   *   .then(lsn => {\n   *      console.log(lsn + ' successfully committed');\n   *   })\n   *   .catch(err => {\n   *      console.log(`Unexpected error during commit of ${lsn}: ${''+err.stack}.`);\n   *   })\n   * ```\n   * @param {number} index - The LSN/index to commit.\n   * @returns {Promise} - A promise that upon success is resolved with the specified, committed LSN/index.\n   */\n  commit(index) {\n    assert.number(index, 'index');\n    return this[$index].commit(index);\n  }\n\n  /**\n   * Writes a log entry.\n   *\n   * The entire contents of the specified `data` buffer is written as the log entry, the actual binary data is treated as opaque in the log. Since the log is not involved in the interpretation of the data, concerns such as encryption and data security is entirely the caller's responsibility.\n   *\n   * ```javascript\n   * wal.write(data)\n   *   .then(lsn => {\n   *      console.log(`Data written as Log Entry ${lsn}.`);\n   *   })\n   *   .catch(err => {\n   *      console.log(`Unexpected error: ${''+err.stack}.`);\n   *   })\n   * ```\n   * @param {Buffer} data - The log entry as an opaque data buffer.\n   * @returns {Promise} A promise that upon success is resolved with the new entry's LSN/index.\n   * @throws {AssertionError} thrown when `data` is unspecified or not a `Buffer`.\n   */\n  write(data) {\n    let log = this[$file];\n    let idx = this[$index];\n    let head = idx.head;\n\n    return idx.offset(head)\n      .then(firstByte => {\n        return log.write(firstByte, data);\n      })\n      .then(subsequentByte => idx.increment(subsequentByte));\n  }\n\n  /**\n   * Reads the log entry at the specified LSN/index.\n   *\n   * ```javascript\n   * wal.read(lsn)\n   *   .then(data => {\n   *     console.log(`Log Entry ${lsn} has ${data.length} bytes of data.`);\n   *   })\n   *   .catch(err => {\n   *      console.log(`Unexpected error: ${''+err.stack}.`);\n   *   })\n   * ```\n   * @param {number} index - Specifies the LSN/index of the log entry to read.\n   * @returns {Promise} A promise that upon success is resolved with a buffer containing the log entry\n   * @throws {AssertionError} Thrown when the LSN/index is out of range.\n   */\n  read(index) {\n    let log = this[$file];\n    let idx = this[$index];\n    return idx.get(index)\n      .then(rec => log.read(rec.offset, rec.length));\n  }\n\n  /**\n   * Reads a range of log entries beginning at the specified `first` LSN/index. If count is not specified all subsequent log entries are returned.\n   *\n   * ```javascript\n   * wal.readRange(first)\n   *   .then(stream => new Promise((resolve, reject) => {\n   *       let acc = [];\n   *       stream.on('data', data => {\n   *          acc.push(data);\n   *        })\n   *        .on('end', () => resolve(acc))\n   *        .on('error', reject);\n   *      }))\n   *   .then(entries => {\n   *     console.log(`There are ${entries.length} log entries after LSN ${first}.`);\n   *   })\n   *   .catch(err => {\n   *      console.log(`Unexpected error: ${''+err.stack}.`);\n   *   })\n   * ```\n   * @param {number} first - Specifies the index of the first log entry to read.\n   * @param {number} count - Specifies the number of log entries to read.\n   * @returns {Readable}  A readable stream where the log entries are streamed to the caller.\n   */\n  readRange(first, count) {\n    assert.number(first, 'first');\n    assert.optionalNumber(count, 'count');\n    let idx = this[$index];\n    let log = this[$file];\n    if (count === undefined) {\n      // head points at the\n      count = (idx.head - first);\n    }\n    // respect the flow-control specified streaming api.\n    let sending = false;\n    let ended = false;\n    let ready = new Queue();\n    let stream;\n\n    function sendUntilPaused() {\n      while (sending && ready.length) {\n        sending = stream.push(ready.dequeue());\n      }\n      if (ended && ready.isEmpty) {\n        stream.push(null);\n        stream.emit('end');\n      }\n    }\n\n    function readyToSend(data) {\n      ready.enqueue(data);\n      sendUntilPaused();\n    }\n\n    function clearToSend() {\n      sending = true;\n      return sendUntilPaused();\n    }\n    // read the entries from the logfile and possibly buffer them\n    // for the readable stream.\n    idx.getRange(first, count)\n      .then(range => range.reduce((acc, rec) =>\n        acc.then(() => log.read(rec.offset, rec.length).then(readyToSend)),\n        Promise.resolve()))\n      .then(() => {\n        if (ready.isEmpty) {\n          stream.push(null);\n          stream.emit('end');\n        } else {\n          ended = true;\n          sendUntilPaused();\n        }\n      })\n      .catch(err => stream.emit('error', err));\n\n    return stream = new Readable({\n      read: clearToSend\n    });\n  }\n\n  /**\n   * Truncates the log from the specified, uncommitted LSN/index.\n   *\n   * Since the `.next` property is usually ahead of the `.commitHead`, when this call succeeds it resets the write head to the newly truncated LSN/index position. Be aware that the very next `.write()` will re-use this most-recent truncated LSN/index.\n   *\n   * ```javascript\n   * wal.truncate(first)\n   *   .then(size => {\n   *     console.log(`There are ${bytes} committed to the log.`);\n   *   })\n   *   .catch(err => {\n   *      console.log(`Unexpected error: ${''+err.stack}.`);\n   *   })\n   * ```\n   * @param {number} from - Specifies the LSN/index where the log entries should be truncated.\n   * @returns {Promise}  A promise that upon success is resolved with the new write head.\n   */\n  truncate(from) {\n    assert.number(from, 'from');\n    let idx = this[$index];\n    let log = this[$file];\n    return idx.truncate(from).then(next => log.truncate(next));\n  }\n\n  recover(handler) {\n    if (handler === false) {\n      handler = () => false;\n    }\n    assert.ok(typeof(handler) === 'function', 'handler (function) is required');\n    let head = this.next;\n    let committed = this.commitHead;\n    let self = this;\n\n    function truncAfterCommitHead() {\n      return self.truncate(self.commitHead + 1)\n        .then(() => self);\n    }\n\n    function possiblyRecover(index) {\n      return self.read(index)\n        .then(data => {\n          let commit = handler(index, data);\n          if (typeof(commit) === 'object' && typeof(commit.then) === 'function') {\n            return commit.then(commit => {\n              if (commit) {\n                return self.commit(index)\n                  .then(committed =>\n                    ((committed + 1) < head) ?\n                    possiblyRecover(committed + 1) :\n                    truncAfterCommitHead());\n              }\n              return truncAfterCommitHead();\n            });\n          }\n          if (commit) {\n            return self.commit(index)\n              .then(committed =>\n                ((committed + 1) < head) ?\n                possiblyRecover(committed + 1) :\n                truncAfterCommitHead());\n          }\n          return truncAfterCommitHead();\n        });\n    }\n    return ((committed + 1) < head) ?\n      possiblyRecover(committed + 1) :\n      Promise.resolve(self);\n  }\n\n  close() {\n    return Promise.all([\n      this[$file].close(),\n      this[$index].close()\n    ]);\n  }\n}\n\nfunction open(options) {\n  assert.object(options, 'options');\n  assert.string(options.path, 'options.path');\n  assert.optionalString(options.index, 'options.index');\n  assert.optionalBool(options.writable, 'options.writable');\n  assert.optionalBool(options.init, 'options.init');\n  let mode = fs.R_OK;\n  if (options.writable) {\n    mode |= fs.W_OK;\n  }\n  let idxFile = options.index || options.path + DEFAULT_INDEX_EXT;\n  let log;\n  // ensure existence/access to files before continuing...\n  return RandomAccessFile.open(options.path, options.writable)\n    .then(file => {\n      log = file;\n      return LogIndexFile.open(idxFile, options.writable);\n    })\n    .then(index => new WriteAheadLog(log, index));\n}\n\nfunction create(options) {\n  assert.object(options, 'options');\n  assert.string(options.path, 'options.path');\n  assert.optionalString(options.index, 'options.index');\n  let idxFile = options.index || options.path + DEFAULT_INDEX_EXT;\n  let log;\n  return RandomAccessFile.create(options.path)\n    .then(file => {\n      log = file;\n      return LogIndexFile.create(idxFile, 0);\n    })\n    .then(index => new WriteAheadLog(log, index));\n}\n\nfunction openOrCreate(options) {\n  return WriteAheadLog.open(options)\n    .catch(err => {\n      // if it doesn't exist we'll create it if writable\n      if (err.code === 'ENOENT' && options.writable) {\n        return WriteAheadLog.create(options);\n      }\n      throw err;\n    });\n}\n\nWriteAheadLog.create = create;\nWriteAheadLog.open = open;\nWriteAheadLog.openOrCreate = openOrCreate;\nWriteAheadLog.DEFAULT_INDEX_EXT = DEFAULT_INDEX_EXT;\n\nexport default WriteAheadLog;\n"
+  },
+  {
+    "__docId__": 45,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "DEFAULT_INDEX_EXT",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~DEFAULT_INDEX_EXT",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 11,
+    "undocument": true,
+    "type": {
+      "types": [
+        "string"
+      ]
+    }
+  },
+  {
+    "__docId__": 46,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$index",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~$index",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 13,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 47,
+    "kind": "variable",
+    "static": true,
+    "variation": null,
+    "name": "$file",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~$file",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 14,
+    "undocument": true,
+    "type": {
+      "types": [
+        "*"
+      ]
+    }
+  },
+  {
+    "__docId__": 48,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "open",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~open",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 321,
+    "undocument": true,
+    "params": [
+      {
+        "name": "options",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 49,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "create",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~create",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 342,
+    "undocument": true,
+    "params": [
+      {
+        "name": "options",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 50,
+    "kind": "function",
+    "static": true,
+    "variation": null,
+    "name": "openOrCreate",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~openOrCreate",
+    "access": null,
+    "export": false,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": null,
+    "description": null,
+    "lineNumber": 356,
+    "undocument": true,
+    "params": [
+      {
+        "name": "options",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 51,
+    "kind": "class",
+    "static": true,
+    "variation": null,
+    "name": "WriteAheadLog",
+    "memberof": "src/write-ahead-log.js",
+    "longname": "src/write-ahead-log.js~WriteAheadLog",
+    "access": null,
+    "export": true,
+    "importPath": "wal/src/write-ahead-log.js",
+    "importStyle": "WriteAheadLog",
+    "description": "An encapsulation of write-ahead logging behavior.\n\nWrite-ahead logging (WAL) is a building block used to improve automicity and durability in distributed systems. WAL improves these properties by providing persistent, sequenced storage for _Log Entries_ as well as a record of which _Log Entries_ have been committed. Write-ahead logging enables systems to recover from failures, whether those failures are in software, storage, or the network.\n\nThis implementation provides a basic semantic on which reliable systems can be built.",
+    "lineNumber": 23,
+    "interface": false
+  },
+  {
+    "__docId__": 52,
+    "kind": "constructor",
+    "static": false,
+    "variation": null,
+    "name": "constructor",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#constructor",
+    "access": null,
+    "description": null,
+    "lineNumber": 25,
+    "undocument": true,
+    "params": [
+      {
+        "name": "file",
+        "types": [
+          "*"
+        ]
+      },
+      {
+        "name": "index",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "generator": false
+  },
+  {
+    "__docId__": 53,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "name",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#name",
+    "access": null,
+    "description": "",
+    "lineNumber": 35,
+    "type": {
+      "nullable": null,
+      "types": [
+        "string"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 54,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "index",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#index",
+    "access": null,
+    "description": "",
+    "lineNumber": 42,
+    "type": {
+      "nullable": null,
+      "types": [
+        "string"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 55,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "writable",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#writable",
+    "access": null,
+    "description": "",
+    "lineNumber": 49,
+    "type": {
+      "nullable": null,
+      "types": [
+        "boolean"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 56,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "size",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#size",
+    "access": null,
+    "description": "",
+    "lineNumber": 56,
+    "type": {
+      "nullable": null,
+      "types": [
+        "number"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 57,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "next",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#next",
+    "access": null,
+    "description": "",
+    "lineNumber": 63,
+    "type": {
+      "nullable": null,
+      "types": [
+        "number"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 58,
+    "kind": "get",
+    "static": false,
+    "variation": null,
+    "name": "commitHead",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#commitHead",
+    "access": null,
+    "description": "",
+    "lineNumber": 70,
+    "type": {
+      "nullable": null,
+      "types": [
+        "number"
+      ],
+      "spread": false,
+      "description": null
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 59,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "isCommitted",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#isCommitted",
+    "access": null,
+    "description": "Determines if the specified LSN/index has been committed.\n\n```javascript\nwal.isCommitted(lsn)\n  .then(committed => {\n     if (committed) console.log(lsn + ' is committed');\n  });\n```",
+    "lineNumber": 86,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Promise} - A promise that upon success is resolved with boolean indicating whether the LSN/index has been committed."
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "index",
+        "description": "The LSN/index to check."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Promise"
+      ],
+      "spread": false,
+      "description": "A promise that upon success is resolved with boolean indicating whether the LSN/index has been committed."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 60,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "commit",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#commit",
+    "access": null,
+    "description": "Commits the specified, uncommitted LSN/index.\n\n```javascript\nwal.commit(lsn)\n  .then(lsn => {\n     console.log(lsn + ' successfully committed');\n  })\n  .catch(err => {\n     console.log(`Unexpected error during commit of ${lsn}: ${''+err.stack}.`);\n  })\n```",
+    "lineNumber": 106,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Promise} - A promise that upon success is resolved with the specified, committed LSN/index."
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "index",
+        "description": "The LSN/index to commit."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Promise"
+      ],
+      "spread": false,
+      "description": "A promise that upon success is resolved with the specified, committed LSN/index."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 61,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "write",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#write",
+    "access": null,
+    "description": "Writes a log entry.\n\nThe entire contents of the specified `data` buffer is written as the log entry, the actual binary data is treated as opaque in the log. Since the log is not involved in the interpretation of the data, concerns such as encryption and data security is entirely the caller's responsibility.\n\n```javascript\nwal.write(data)\n  .then(lsn => {\n     console.log(`Data written as Log Entry ${lsn}.`);\n  })\n  .catch(err => {\n     console.log(`Unexpected error: ${''+err.stack}.`);\n  })\n```",
+    "lineNumber": 129,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Promise} A promise that upon success is resolved with the new entry's LSN/index."
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "Buffer"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "data",
+        "description": "The log entry as an opaque data buffer."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Promise"
+      ],
+      "spread": false,
+      "description": "A promise that upon success is resolved with the new entry's LSN/index."
+    },
+    "throws": [
+      {
+        "types": [
+          "AssertionError"
+        ],
+        "description": "thrown when `data` is unspecified or not a `Buffer`."
+      }
+    ],
+    "generator": false
+  },
+  {
+    "__docId__": 62,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "read",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#read",
+    "access": null,
+    "description": "Reads the log entry at the specified LSN/index.\n\n```javascript\nwal.read(lsn)\n  .then(data => {\n    console.log(`Log Entry ${lsn} has ${data.length} bytes of data.`);\n  })\n  .catch(err => {\n     console.log(`Unexpected error: ${''+err.stack}.`);\n  })\n```",
+    "lineNumber": 157,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Promise} A promise that upon success is resolved with a buffer containing the log entry"
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "index",
+        "description": "Specifies the LSN/index of the log entry to read."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Promise"
+      ],
+      "spread": false,
+      "description": "A promise that upon success is resolved with a buffer containing the log entry"
+    },
+    "throws": [
+      {
+        "types": [
+          "AssertionError"
+        ],
+        "description": "Thrown when the LSN/index is out of range."
+      }
+    ],
+    "generator": false
+  },
+  {
+    "__docId__": 63,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "readRange",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#readRange",
+    "access": null,
+    "description": "Reads a range of log entries beginning at the specified `first` LSN/index. If count is not specified all subsequent log entries are returned.\n\n```javascript\nwal.readRange(first)\n  .then(stream => new Promise((resolve, reject) => {\n      let acc = [];\n      stream.on('data', data => {\n         acc.push(data);\n       })\n       .on('end', () => resolve(acc))\n       .on('error', reject);\n     }))\n  .then(entries => {\n    console.log(`There are ${entries.length} log entries after LSN ${first}.`);\n  })\n  .catch(err => {\n     console.log(`Unexpected error: ${''+err.stack}.`);\n  })\n```",
+    "lineNumber": 188,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Readable}  A readable stream where the log entries are streamed to the caller."
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "first",
+        "description": "Specifies the index of the first log entry to read."
+      },
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "count",
+        "description": "Specifies the number of log entries to read."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Readable"
+      ],
+      "spread": false,
+      "description": "A readable stream where the log entries are streamed to the caller."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 64,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "truncate",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#truncate",
+    "access": null,
+    "description": "Truncates the log from the specified, uncommitted LSN/index.\n\nSince the `.next` property is usually ahead of the `.commitHead`, when this call succeeds it resets the write head to the newly truncated LSN/index position. Be aware that the very next `.write()` will re-use this most-recent truncated LSN/index.\n\n```javascript\nwal.truncate(first)\n  .then(size => {\n    console.log(`There are ${bytes} committed to the log.`);\n  })\n  .catch(err => {\n     console.log(`Unexpected error: ${''+err.stack}.`);\n  })\n```",
+    "lineNumber": 261,
+    "unknown": [
+      {
+        "tagName": "@returns",
+        "tagValue": "{Promise}  A promise that upon success is resolved with the new write head."
+      }
+    ],
+    "params": [
+      {
+        "nullable": null,
+        "types": [
+          "number"
+        ],
+        "spread": false,
+        "optional": false,
+        "name": "from",
+        "description": "Specifies the LSN/index where the log entries should be truncated."
+      }
+    ],
+    "return": {
+      "nullable": null,
+      "types": [
+        "Promise"
+      ],
+      "spread": false,
+      "description": "A promise that upon success is resolved with the new write head."
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 65,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "recover",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#recover",
+    "access": null,
+    "description": null,
+    "lineNumber": 268,
+    "undocument": true,
+    "params": [
+      {
+        "name": "handler",
+        "types": [
+          "*"
+        ]
+      }
+    ],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 66,
+    "kind": "method",
+    "static": false,
+    "variation": null,
+    "name": "close",
+    "memberof": "src/write-ahead-log.js~WriteAheadLog",
+    "longname": "src/write-ahead-log.js~WriteAheadLog#close",
+    "access": null,
+    "description": null,
+    "lineNumber": 313,
+    "undocument": true,
+    "params": [],
+    "return": {
+      "types": [
+        "*"
+      ]
+    },
+    "generator": false
+  },
+  {
+    "__docId__": 68,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Infinity",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Infinity",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Infinity",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 69,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "NaN",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/NaN",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~NaN",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 70,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "undefined",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/undefined",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~undefined",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 71,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "null",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/null",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~null",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 72,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Object",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Object",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 73,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "object",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~object",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 74,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Function",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Function",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 75,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "function",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~function",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 76,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Boolean",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Boolean",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Boolean",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 77,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "boolean",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Boolean",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~boolean",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 78,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Symbol",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Symbol",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 79,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Error",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Error",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 80,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "EvalError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/EvalError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~EvalError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 81,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "InternalError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/InternalError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~InternalError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 82,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "RangeError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/RangeError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~RangeError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 83,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "ReferenceError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/ReferenceError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~ReferenceError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 84,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "SyntaxError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SyntaxError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~SyntaxError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 85,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "TypeError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypeError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~TypeError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 86,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "URIError",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/URIError",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~URIError",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 87,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Number",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Number",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 88,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "number",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~number",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 89,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Date",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Date",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 90,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "String",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~String",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 91,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "string",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~string",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 92,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "RegExp",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/RegExp",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~RegExp",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 93,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 94,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Int8Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Int8Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Int8Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 95,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Uint8Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Uint8Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 96,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Uint8ClampedArray",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Uint8ClampedArray",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Uint8ClampedArray",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 97,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Int16Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Int16Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Int16Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 98,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Uint16Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Uint16Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Uint16Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 99,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Int32Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Int32Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Int32Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 100,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Uint32Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Uint32Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Uint32Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 101,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Float32Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Float32Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Float32Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 102,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Float64Array",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Float64Array",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Float64Array",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 103,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Map",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Map",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 104,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Set",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Set",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Set",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 105,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "WeakMap",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WeakMap",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~WeakMap",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 106,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "WeakSet",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WeakSet",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~WeakSet",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 107,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "ArrayBuffer",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~ArrayBuffer",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 108,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "DataView",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/DataView",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~DataView",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 109,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "JSON",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~JSON",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 110,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Promise",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Promise",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 111,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Generator",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Generator",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Generator",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 112,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "GeneratorFunction",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/GeneratorFunction",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~GeneratorFunction",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 113,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Reflect",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Reflect",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 114,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Proxy",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy",
+    "memberof": "BuiltinExternal/ECMAScriptExternal.js",
+    "longname": "BuiltinExternal/ECMAScriptExternal.js~Proxy",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 116,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "CanvasRenderingContext2D",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~CanvasRenderingContext2D",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 117,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "DocumentFragment",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/DocumentFragment",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~DocumentFragment",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 118,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Element",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/Element",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~Element",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 119,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Event",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/Event",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~Event",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 120,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "Node",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/Node",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~Node",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 121,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "NodeList",
+    "externalLink": "https://developer.mozilla.org/en-US/docs/Web/API/NodeList",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~NodeList",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 122,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "XMLHttpRequest",
+    "externalLink": "https://developer.mozilla.org/en/docs/Web/API/XMLHttpRequest",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~XMLHttpRequest",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  },
+  {
+    "__docId__": 123,
+    "kind": "external",
+    "static": true,
+    "variation": null,
+    "name": "AudioContext",
+    "externalLink": "https://developer.mozilla.org/en/docs/Web/API/AudioContext",
+    "memberof": "BuiltinExternal/WebAPIExternal.js",
+    "longname": "BuiltinExternal/WebAPIExternal.js~AudioContext",
+    "access": null,
+    "description": "",
+    "builtinExternal": true
+  }
+]

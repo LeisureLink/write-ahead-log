@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <base data-ice="baseUrl" href="../../">
+  <title data-ice="title">src/log-index-file.js | API Document</title>
+  <link type="text/css" rel="stylesheet" href="css/style.css">
+  <link type="text/css" rel="stylesheet" href="css/prettify-tomorrow.css">
+  <script src="script/prettify/prettify.js"></script>
+  
+  
+  <script src="script/manual.js"></script>
+</head>
+<body class="layout-container" data-ice="rootContainer">
+
+<header>
+  <a href="./">Home</a>
+  
+  <a href="identifiers.html">Reference</a>
+  <a href="source.html">Source</a>
+  
+  <a data-ice="repoURL" href="https://github.com/LeisureLink/write-ahead-log" class="repo-url-github">Repository</a>
+  <div class="search-box">
+  <span>
+    <img src="./image/search.png">
+    <span class="search-input-edge"></span><input class="search-input"><span class="search-input-edge"></span>
+  </span>
+    <ul class="search-result"></ul>
+  </div>
+</header>
+
+<nav class="navigation" data-ice="nav"><div>
+  <ul>
+    
+  <li data-ice="doc"><span data-ice="kind" class="kind-class">C</span><span data-ice="name"><span><a href="class/src/log-index-file.js~LogIndexFile.html">LogIndexFile</a></span></span></li>
+<li data-ice="doc"><span data-ice="kind" class="kind-class">C</span><span data-ice="name"><span><a href="class/src/queue.js~Queue.html">Queue</a></span></span></li>
+<li data-ice="doc"><span data-ice="kind" class="kind-class">C</span><span data-ice="name"><span><a href="class/src/write-ahead-log.js~WriteAheadLog.html">WriteAheadLog</a></span></span></li>
+</ul>
+</div>
+</nav>
+
+<div class="content" data-ice="content"><h1 data-ice="title">src/log-index-file.js</h1>
+<pre class="source-code line-number raw-source-code"><code class="prettyprint linenums" data-ice="content">&apos;use strict&apos;;
+
+import assert from &apos;assert-plus&apos;;
+import RandomAccessFile from &apos;ranfile&apos;;
+
+/******************************************************************************
+The log index file is a side-file that tracks the byte offsets to each distinct
+log entry. Using the side-file indexing scheme, we are able to efficiently
+store and retrieve each distinct log entry without having to care about the
+entry&apos;s byte content. In this scheme, log-serial-numbers (LSNs) are the natural
+integer index at which the log entry was written, as if being written to an
+array.
+
+Layout:
+
+marker   -- 4 marker bytes identifying the file&apos;s type: IDX$
+base     -- 4 bytes integer (big-endian); an index offset, usually 0 (zero).
+            Offsets are only meaningful when indexes are split across many
+            files so are a placeholder for future work.
+head     -- 4 bytes integer (big-endian); the write head (next unused entry)
+commit   -- 4 bytes integer (big-endian); the commit head (may trail head)
+
+In this layout there are 16 header bytes (hlen), therefore each subsequent 4
+bytes contains a pointer to a log entry&apos;s starting byte in the indexed write-
+ahead-log (WAL).
+
+hlen + ((index - base) * sizeof(int))
+
+
+Example (octets)...
+
+            Base      Head        Commit      Index 0     Index 1
+            v           v           v           V           v
+49 44 58 24 00 00 00 00 00 00 00 02 00 00 00 01 00 00 00 00 00 00 00 58 \
+
+Index 2
+v
+00 00 02 1f
+
+Log Entry 0 begins at byte 0
+Log Entry 1 begins at byte 88
+Log Entry 2 begins at byte 543
+
+
+
+******************************************************************************/
+
+const MARKER = &apos;IDX$&apos;;
+const OFS_MARKER = 0;
+const OFS_BASEINDEX = 4;
+const OFS_HEAD = 8;
+const OFS_COMMIT = 12;
+const HLEN = 16;
+const SIZEOF_INT = 4;
+const DEF_COMMIT = -1;
+
+const $file = Symbol(&apos;file&apos;);
+const $header = Symbol(&apos;header&apos;);
+
+function allocFill(len) {
+  return (Buffer.alloc) ?
+    Buffer.alloc(len) :
+    new Buffer(len); // deprecated in 5.x+
+}
+
+class LogIndexFile {
+
+  constructor(file) {
+    assert.object(file, &apos;file&apos;);
+    assert.func(file.read, &apos;file.read&apos;);
+    assert.func(file.write, &apos;file.write&apos;);
+    assert.func(file.close, &apos;file.close&apos;);
+    if (file.size &lt; HLEN) {
+      throw new Error(&apos;File too small to be an index file.&apos;);
+    }
+    this[$file] = file;
+  }
+
+  get name() { return this[$file].name; }
+
+  get writable() {
+    return this[$file].writable;
+  }
+
+  get marker() {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    return this[$header].toString(&apos;ascii&apos;, OFS_MARKER, OFS_BASEINDEX);
+  }
+
+  get baseIndex() {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    return this[$header].readInt32BE(OFS_BASEINDEX, true);
+  }
+
+  get head() {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    return this[$header].readInt32BE(OFS_HEAD, true);
+  }
+
+  get commitHead() {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    return this[$header].readInt32BE(OFS_COMMIT, true);
+  }
+
+  isCommitted(index) {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    return index &lt; this.commitHead;
+  }
+
+  commit(index) {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    assert.number(index, &apos;index&apos;);
+    let expected = this.commitHead + 1;
+    if (index &lt; expected) {
+      return Promise.resolve(index);
+    }
+    if (index !== expected) {
+      return Promise.reject(new Error(`Out of order commit; expected ${expected} but received ${index}.`));
+    }
+    this[$header].writeInt32BE(index, OFS_COMMIT, true);
+    return this[$file].write(OFS_COMMIT, this[$header], OFS_COMMIT, SIZEOF_INT)
+      .then(() =&gt; index);
+  }
+
+  localizeIndex(index) {
+    assert.number(index, &apos;index&apos;);
+    index = index - this.baseIndex;
+    return index;
+  }
+
+  globalizeIndex(index) {
+    assert.number(index, &apos;index&apos;);
+    index = index + this.baseIndex;
+    return index;
+  }
+
+  offset(index) {
+    assert.ok(index &lt;= this.head, &apos;index out of range&apos;);
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);
+    return this[$file].read(ofs, SIZEOF_INT)
+      .then(data =&gt; {
+        let offset = data.readInt32BE(0, SIZEOF_INT);
+        return offset;
+      });
+  }
+
+  get(index) {
+    assert.number(index, &apos;index&apos;);
+    assert.ok(index &lt; this.head, &apos;index out of range&apos;);
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);
+    return this[$file].read(ofs, 2 * SIZEOF_INT)
+      .then(data =&gt; {
+        let offset = data.readInt32BE(0, SIZEOF_INT);
+        return {
+          offset,
+          length: data.readInt32BE(SIZEOF_INT, SIZEOF_INT) - offset
+        };
+      });
+  }
+
+  getRange(index, count) {
+    assert.number(index, &apos;index&apos;);
+    assert.ok(index &lt; this.head, &apos;index out of range&apos;);
+    assert.number(count, &apos;count&apos;);
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    // head points at the next entry
+    let limit = (this.head - index);
+    assert.ok(count &lt;= limit, &apos;count puts index out of range&apos;);
+    let ofs = HLEN + (this.localizeIndex(index) * SIZEOF_INT);
+    return this[$file].read(ofs, (count + 1) * SIZEOF_INT)
+      .then(data =&gt; {
+        let i = -1;
+        let result = [];
+        while (++i &lt; count) {
+          let offset = data.readInt32BE(i * SIZEOF_INT, SIZEOF_INT);
+          result.push({
+            index: index + i,
+            offset,
+            length: data.readInt32BE((i + 1) * SIZEOF_INT, SIZEOF_INT) - offset
+          });
+        }
+        return result;
+      });
+  }
+
+  truncate(from) {
+    assert.number(from, &apos;from&apos;);
+    assert.ok(from &gt; this.commitHead, &apos;cannot truncate a committed log entry&apos;);
+    assert.ok(from &lt; this.head, &apos;index out of range&apos;);
+    let header = this[$header];
+    header.writeInt32BE(from, OFS_HEAD, SIZEOF_INT);
+    return this[$file].write(OFS_HEAD, header, OFS_HEAD, SIZEOF_INT)
+      .then(() =&gt; {
+        if (this.head === this.baseIndex) {
+          return this[$file].read(HLEN, SIZEOF_INT)
+            .then(data =&gt; {
+              return {
+                offset: data.readInt32BE(0, SIZEOF_INT),
+                length: 0
+              };
+            });
+        }
+        return this.get(this.head - 1);
+      })
+      .then(rec =&gt; rec.offset + rec.length);
+  }
+
+  increment(offset) {
+    assert.ok(this[$header], &apos;index must be open&apos;);
+    // write the offset into the next index location (typically at EOF),
+    // then update and write the header reference, which completes the
+    // increment.
+    let header = this[$header];
+    let current = this.head;
+    let next = current + 1;
+    let ofs = HLEN + (this.localizeIndex(next) * SIZEOF_INT);
+    let data = allocFill(SIZEOF_INT);
+    data.writeInt32BE(offset, 0, SIZEOF_INT);
+    return this[$file].write(ofs, data)
+      .then(() =&gt; {
+        header.writeInt32BE(next, OFS_HEAD, SIZEOF_INT);
+        return this[$file].write(OFS_HEAD, header, OFS_HEAD, SIZEOF_INT);
+      })
+      .then(() =&gt; {
+        return current;
+      });
+  }
+
+  open() {
+    assert.ok(!this[$header], &apos;index already open&apos;);
+    let file = this[$file];
+    return file.read(OFS_MARKER, HLEN)
+      .then(data =&gt; {
+        let marker = data.toString(&apos;ascii&apos;, OFS_MARKER, OFS_BASEINDEX);
+        if (marker !== MARKER) {
+          throw new Error(`Invalid index file; expected file marker to be ${MARKER} but found ${marker}.`);
+        }
+        this[$header] = data;
+        return this;
+      });
+  }
+
+  close() {
+    return this[$file].close()
+      .then(() =&gt; {
+        this[$header] = null;
+      });
+  }
+
+}
+
+function open(path, writable) {
+  assert.string(path, &apos;path&apos;);
+  assert.optionalBool(writable, &apos;writable&apos;);
+  writable = writable === true;
+  return RandomAccessFile.open(path, writable)
+    .then(file =&gt; new LogIndexFile(file).open());
+}
+
+function create(path, baseIndex, byteOffset) {
+  assert.string(path, &apos;path&apos;);
+  assert.optionalNumber(baseIndex, &apos;baseIndex&apos;);
+  assert.optionalNumber(byteOffset, &apos;byteOffset&apos;);
+  if (baseIndex === undefined) {
+    baseIndex = 0;
+  }
+  if (byteOffset === undefined) {
+    byteOffset = 0;
+  }
+  let data = allocFill(HLEN + SIZEOF_INT);
+  data.write(MARKER, &apos;ascii&apos;);
+  data.writeInt32BE(baseIndex, OFS_BASEINDEX, true);
+  data.writeInt32BE(baseIndex, OFS_HEAD, true);
+  data.writeInt32BE(DEF_COMMIT, OFS_COMMIT, true);
+  data.writeInt32BE(byteOffset, HLEN, true);
+  return RandomAccessFile.create(path)
+    .then(file =&gt; file.write(OFS_MARKER, data)
+      .then(() =&gt; new LogIndexFile(file).open()));
+}
+
+LogIndexFile.open = open;
+LogIndexFile.create = create;
+
+export default LogIndexFile;
+</code></pre>
+
+</div>
+
+<footer class="footer">
+  Generated by <a href="https://esdoc.org">ESDoc<span data-ice="esdocVersion">(0.4.7)</span></a>
+</footer>
+
+<script src="script/search_index.js"></script>
+<script src="script/search.js"></script>
+<script src="script/pretty-print.js"></script>
+<script src="script/inherited-summary.js"></script>
+<script src="script/test-summary.js"></script>
+<script src="script/inner-link.js"></script>
+<script src="script/patch-for-local.js"></script>
+</body>
+</html>
