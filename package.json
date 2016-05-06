@@ -1,6 +1,6 @@
 {
   "name": "wal",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "An implementation of write-ahead logging (WAL) for nodejs.",
   "main": "index.js",
   "scripts": {
