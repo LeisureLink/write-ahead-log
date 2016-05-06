@@ -14,7 +14,7 @@ In our implementation, _Log Entries_ are opaque binary values, defined and inter
 
 We also define _Log Serial Number_ (LSN) as an integer identfier numbered from 0 (zero) and incremented for each _Log Entry_. Our implementation guarantees that committed LSNs will never repeat or be re-issued.
 
-We provide a simple recovery mechanism that visits each uncommitted entry in order and commits these as long as the handler you supply indicates it is safe to do so; when your handler indicates, remaining uncommitted _Log Entries_ are truncated. The LSN/index associated with those uncommitted _Log Entries_ will be re-issued whan a subsequent _Log Entry_ is made. This scheme enables our algorithm to be simple and fast. If your code requires guaranteed unique LSNs across restarts (a requirement for most database systems), we feel we have provided the collaboration semantics necessary for you to implement such guarantees on top of `wal` as an additional level of LSN indirection.
+We provide a simple recovery mechanism that visits each uncommitted entry, in order, and commits each, as long as the handler you supply indicates it is safe to do so by returning a truthy value; when your handler returns a falsy value, remaining uncommitted _Log Entries_ are truncated. The LSN/index associated with those uncommitted _Log Entries_ will be re-issued whan a subsequent _Log Entry_ is made. This scheme enables our algorithm to be simple and fast. If your code requires guaranteed unique LSNs across restarts (a requirement for most database systems), we feel we have provided the collaboration semantics necessary for you to implement such guarantees on top of `wal` as an additional level of LSN indirection.
 
 ## Use
 
