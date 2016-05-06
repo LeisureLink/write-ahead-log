@@ -21,6 +21,16 @@ function spool(stream) {
 
 //function randomInt(low, high) {return Math.floor(Math.random() * (high - low) + low); }
 
+test('.ctor errors when called as fn', t => {
+  // behavior put in place by babel's transpiler
+  t.throws(() => {
+    WriteAheadLog();
+  },
+  'TypeError: Cannot call class as function',
+  'TypeError: Cannot call class as function');
+  t.end();
+});
+
 test('WriteAheadLog.create() fails without options', t => {
   t.throws(() => WriteAheadLog.create(), 'AssertionError: options (object) is required');
   t.end();
@@ -107,6 +117,23 @@ test('WriteAheadLog.open({ path: \'random-temp\' }) fails when file doesn\'t exi
   });
 });
 
+test('WriteAheadLog.open({ path: \'random-temp\' }) succeeds opening a valid log', t => {
+  tmp.tmpName((err, path) => {
+    if (err) t.fail('' + err);
+    WriteAheadLog.create({ path })
+      .then(wal => wal.close())
+      .then(() => WriteAheadLog.open({ path })
+        .then(wal => {
+          t.notOk(wal.writable, 'opened file without writable mode');
+          t.equal(wal.name, path, 'opened file is the created file');
+          t.end();
+        }))
+      .catch(err => {
+        t.fail('' + err);
+      });
+  });
+});
+
 test('WriteAheadLog.openOrCreate() fails without options', t => {
   t.throws(() => WriteAheadLog.openOrCreate(), 'AssertionError: options (object) is required');
   t.end();
@@ -175,6 +202,7 @@ test('WriteAheadLog.openOrCreate({ path: \'random-temp\', index: \'specified\', 
     if (err) t.fail('' + err);
     WriteAheadLog.openOrCreate({ path, index, writable: true })
       .then(wal => {
+        t.ok(wal.writable, 'new logs are writable');
         t.equal(wal.name, path, '.name is the temp file');
         t.equal(wal.index, index, '.index has the specified name');
         t.equal(wal.size, 0, '.size is 0 (zero)');
@@ -333,6 +361,10 @@ test('.commit(lsn) succeeds when committing first entry in order', t => {
         return buffers.reduce(
             (acc, data) => acc.then(() => wal.write(data)),
             Promise.resolve())
+          // verify the entries are uncommitted
+          .then(() => {
+            buffers.forEach((b, i) => t.notOk(wal.isCommitted(i), `${i} is uncommitted`));
+          })
           // commit first entry
           .then(() => wal.commit(0))
           .then(lsn => {
@@ -346,6 +378,37 @@ test('.commit(lsn) succeeds when committing first entry in order', t => {
       });
   });
 });
+
+test('.commit(lsn) overcommitting an LSN is benign (but dumb)', t => {
+  tmp.tmpName((err, path) => {
+    if (err) t.fail('' + err);
+    let buffers = [
+      new Buffer('commit first data.', 'utf8'),
+      new Buffer('commit second data.', 'utf8'),
+      new Buffer('commit third data.', 'utf8')
+    ];
+    WriteAheadLog.create({ path })
+      .then(wal => {
+        // write all buffers as log entries
+        return buffers.reduce(
+            (acc, data) => acc.then(() => wal.write(data)),
+            Promise.resolve())
+          // commit first entry
+          .then(() => wal.commit(0))
+          // overcommit first entry
+          .then(() => wal.commit(0))
+          .then(lsn => {
+            t.equals(lsn, 0, 'success response is the committed LSN');
+            t.equals(wal.commitHead, lsn, '.committedHead equals specified LSN');
+            t.end();
+          });
+      })
+      .catch(err => {
+        t.fail('' + err.stack);
+      });
+  });
+});
+
 
 test('.commit(lsn) succeeds when committing multiple entries in order', t => {
   tmp.tmpName((err, path) => {
@@ -430,6 +493,33 @@ test('.truncate(lsn) fails when LSN has already been committed', t => {
           'AssertionError: cannot truncate a committed log entry');
         t.end();
       });
+  });
+});
+
+test('.truncate(lsn) succeeds at the .baseIndex', t => {
+  tmp.tmpName((err, path) => {
+    if (err) t.fail('' + err);
+    let buffers = [
+      new Buffer('commit first data.', 'utf8'),
+      new Buffer('commit second data.', 'utf8'),
+      new Buffer('commit third data.', 'utf8')
+    ];
+    WriteAheadLog.create({ path })
+      .then(wal => {
+        // write all buffers as log entries
+        return buffers.reduce(
+            (acc, data) => acc.then(() => wal.write(data)),
+            Promise.resolve())
+          // try to truncate at the base
+          .then(() => wal.truncate(0))
+          .then(size => {
+            t.equal(size, wal.size, 'result is truncated log size in bytes');
+            t.equal(wal.next, 0, 'truncated entry becomes new write head (.next)');
+            t.equal(wal.commitHead, -1, '.committedHead equals last committed LSN');
+            t.end();
+          });
+      })
+      .catch(err => t.fail('' + err.stack));
   });
 });
 
@@ -639,6 +729,49 @@ test('.recover(handler) handler is called for each uncommitted entry', t => {
               .then(() => {
                 t.equal(wal.next, buffers.length, '.next is the committed count');
                 t.equal(wal.commitHead, buffers.length - 1, '.commitHead is the last LSN committed');
+                t.end();
+                resolve();
+              })
+              .catch(err => reject(err));
+          }));
+      })
+      .catch(err => t.fail('' + err.stack));
+  });
+});
+
+test('.recover(handler) handler can optionally return Promise', t => {
+  tmp.tmpName((err, path) => {
+    if (err) t.fail('' + err);
+    let buffers = [
+      new Buffer('commit first data.', 'utf8'),
+      new Buffer('commit second data.', 'utf8'),
+      new Buffer('commit third data.', 'utf8'),
+      new Buffer('commit fourth data.', 'utf8')
+    ];
+    WriteAheadLog.create({ path })
+      .then(wal => {
+        // write all buffers as log entries
+        return buffers.reduce(
+            (acc, data) => acc.then(() => wal.write(data)
+              .then(lsn => {
+                return (lsn < 2) ? wal.commit(lsn) : lsn;
+              })),
+            Promise.resolve())
+          .then(() => new Promise((resolve, reject) => {
+            let n = 2;
+
+            function recoveryHandler(lsn, entry) {
+              t.equal(lsn, n, `LSNs are processed in order: ${n}`);
+              t.equal(entry.toString('hex'), buffers[n++].toString('hex'), 'entry has expected binary data');
+              return new Promise((resolve) => {
+                // commit all but the last on recovery
+                setTimeout(() => resolve(lsn < 3), 200);
+              });
+            }
+            return wal.recover(recoveryHandler)
+              .then(() => {
+                t.equal(wal.next, buffers.length - 1, '.next is the committed count');
+                t.equal(wal.commitHead, wal.next - 1, '.commitHead is the last LSN committed');
                 t.end();
                 resolve();
               })

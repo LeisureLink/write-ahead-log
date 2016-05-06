@@ -262,9 +262,7 @@ class WriteAheadLog {
     assert.number(from, 'from');
     let idx = this[$index];
     let log = this[$file];
-    return (from < this.next) ?
-      idx.truncate(from).then(next => log.truncate(next)) :
-      idx.offset(from).then(offset => log.truncate(offset));
+    return idx.truncate(from).then(next => log.truncate(next));
   }
 
   recover(handler) {

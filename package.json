@@ -16,8 +16,9 @@
     "lint": "eslint .",
     "test": "tape -r babel-register test/**/*.test.js | tap-spec",
     "test:watch": "chokidar . -c 'npm test'",
+    "cover": "istanbul cover test",
     "ci": "npm run lint && npm test",
-    "clean": "rm -rf ./build",
+    "clean": "rm -rf ./build ./coverage .coverag*",
     "build": "npm run clean && babel src/ -s inline -d build/",
     "prepublish": "npm run build"
   },
@@ -45,6 +46,7 @@
     "chokidar-cli": "^1.2.0",
     "deep-equal": "^1.0.1",
     "esdoc": "^0.4.7",
+    "istanbul": "^0.4.3",
     "tap-spec": "^4.1.1",
     "tape": "^4.5.1",
     "tmp": "0.0.28"
