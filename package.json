@@ -11,8 +11,8 @@
   ],
   "main": "index.js",
   "scripts": {
-    "doc": "esdoc -c ./esdoc.json",
-    "doc:watch": "chokidar -i doc -c 'npm run doc' .",
+    "docs": "esdoc -c ./esdoc.json",
+    "docs:watch": "chokidar -i doc -c 'npm run doc' .",
     "lint": "eslint .",
     "test": "tape -r babel-register test/**/*.test.js | tap-spec",
     "test:watch": "chokidar . -c 'npm test'",

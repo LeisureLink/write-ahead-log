@@ -19,7 +19,7 @@ We provide a simple recovery mechanism that visits each uncommitted entry, in or
 ## Install
 
 ```bash
-npm install wal 
+npm install wal
 ```
 
 ## Use
@@ -36,7 +36,7 @@ import { WriteAheadLog } from 'wal';
 
 ### Write-Work-Commit Cycle
 
-Write-ahead logging is accomplished through in a _write-work-commit_ cycle. 
+Write-ahead logging is accomplished through in a _write-work-commit_ cycle.
 
 * First &mdash; `write` a log entry containing enough information to describe the activity and recover it if there is a subsequent failure,
 * Second &mdash; perform the work,
@@ -97,20 +97,15 @@ Chaos can occur at any time, for an illustration of simple failure and recovery,
 
 ### Sequencing
 
-`wal` imposes sequencing of commits; LSN/indexes must be committed in order. Obviously parallel operations, such as those waiting on IO will often complete out of order. It is the responsibility of the caller to ensure that out of order completion is resequenced before being applied to the log for commit.
+`wal` imposes strict ordering of commits; LSN/indexes must be committed in order. Obviously parallel operations, such as those waiting on IO will often complete out of order. It is the responsibility of the caller to ensure that out of order completion is resequenced before being applied to the log for commit.
 
-## More Documentation
+## Detailed Documentation (esdoc)
 
-Detailed documentation can be generated locally using npm scripts:
+Detailed documentation is produced from code using [`esdoc`](https://esdoc.org/) and [is available online](https://leisurelink.github.io/write-ahead-log/).
 
-```bash
-git clone git@github.com:LeisureLink/write-ahead-log.git
-cd write-ahead-log
-npm install && npm run doc
-open doc/index.html
-```
+To build the documentation locally, use `npm run docs` on the command line.
 
-### Module API
+## Module API
 
 **Classes:**
 
