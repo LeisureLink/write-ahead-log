@@ -1,4 +1,4 @@
-# write-ahead-log
+# write-ahead-log [![Circle CI](https://circleci.com/gh/LeisureLink/write-ahead-log.svg?style=svg)](https://circleci.com/gh/LeisureLink/write-ahead-log)
 
 An implementation of write-ahead logging (WAL) for nodejs.
 
@@ -69,7 +69,7 @@ WriteAheadLog.openOrCreate({ path, writable })
 
 ```
 
-Chaos can occur at any time, for an illustration of simple failure and recovery, run the example script [chaotic-operations]() and monitor what happens in both the log and index. This should give you a feel for how to scaffold on top of `wal`.
+Chaos can occur at any time, for an illustration of simple failure and recovery, run the example script [chaotic-operations](https://github.com/LeisureLink/write-ahead-log/blob/master/examples/chaotic-operations.js) and monitor what happens in both the log and index. This should give you a feel for how to scaffold on top of `wal`.
 
 ## More Documentation
 
@@ -121,4 +121,4 @@ An encapsulation of write-ahead logging behavior.
 
 ## License
 
-[MIT](https://github.com/LeisureLink/random-access-file/blob/master/LICENSE)
+[MIT](https://github.com/LeisureLink/write-ahead-log/blob/master/LICENSE)
